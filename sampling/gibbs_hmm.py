@@ -1,8 +1,11 @@
-from sampling.gibbs_sampling import NormalizingConditional, gibbs_sampler, GibbsState
+from sampling.gibbs_sampling import NormalizingConditional, gibbs_sampler, GibbsState, Statistic, Paperclip,\
+    Transform, StatisticSetter, ProvidingState
 from util import default_rng
 from util.log_space import log, log_add
 from collections import defaultdict
 from structures import TaggedSents
+from typing import TypeVar, Generic, Iterable, Tuple, List
+from enum import IntEnum
 import numpy as np
 
 
@@ -16,7 +19,10 @@ def uniform_init(tag_set, rng, n_sents, s_lengths, n_tokens):
     return initial_tags
 
 
-class TagsAssignment(TaggedSents):
+Index = Tuple[int, int]
+
+
+class TagAssignment(TaggedSents, ProvidingState[Index, 'TagAssigment']):
 
     class Wrapper:
 
@@ -37,23 +43,24 @@ class TagsAssignment(TaggedSents):
     class WrapperWrapper(Wrapper):
 
         def __init__(self, wrapped, inner_mapping=None):
-            super(TagsAssignment.WrapperWrapper, self).__init__(wrapped,
-                                                                mapping=lambda x: TagsAssignment.Wrapper(
+            super(TagAssignment.WrapperWrapper, self).__init__(wrapped,
+                                                               mapping=lambda x: TagAssignment.Wrapper(
                                                                     x, mapping=inner_mapping)
-                                                                )
+                                                               )
 
     class TagsWrapper(WrapperWrapper):
 
         def __init__(self, outer_instance):
-            super(TagsAssignment.TagsWrapper, self).__init__(outer_instance.tags,
-                                                             inner_mapping=lambda x: outer_instance.tag_externer[x])
+            super(TagAssignment.TagsWrapper, self).__init__(outer_instance.tags,
+                                                            inner_mapping=lambda x: outer_instance.tag_externer[x])
 
     class SentsWrapper(WrapperWrapper):
 
         def __init__(self, outer_instance):
-            super(TagsAssignment.SentsWrapper, self).__init__(outer_instance.sents, inner_mapping=None)
+            super(TagAssignment.SentsWrapper, self).__init__(outer_instance.sents, inner_mapping=None)
 
     def __init__(self, sentences, tagset, initial_tags=None, init_method=uniform_init, rng=default_rng):
+        super(TagAssignment, self).__init__()
         self.sents = sentences
         self.s_lengths = [len(s) for s in self.sents]
         self.n_tokens = sum(self.s_lengths)
@@ -74,33 +81,37 @@ class TagsAssignment(TaggedSents):
 
         self.tags = [[self.tag_interner[tag] for tag in tags] for tags in initial_tags]
 
-        self.external_tags = TagsAssignment.TagsWrapper(self)
-        self.external_sents = TagsAssignment.SentsWrapper(self)
+        self.external_tags = TagAssignment.TagsWrapper(self)
+        self.external_sents = TagAssignment.SentsWrapper(self)
 
-    def get_word(self, index):
+    def get_word(self, index: Index):
         (i, j) = index
         return self.sents[i][j]
 
-    def get_tag(self, index):
+    def get_tag(self, index: Index):
         if self.is_eos(index):
             return self.eos
         if self.is_sos(index):
             return self.sos
         return self.tags[index[0]][index[1]]
 
-    def admissible(self, index):
+    def get_value(self, index: Index):
+        return self.get_tag(index)
+
+    def admissible(self, index: Index):
         if self.is_eos(index):
-            return '<eos>',
+            return ['<eos>'],
         else:
             if self.is_sos(index):
                 return ['<sos>'],
             else:
                 return self.tagset
 
-    def is_eos(self, index):
+    def is_eos(self, index: Index):
         return index[1] >= self.s_lengths[index[0]]
 
-    def is_sos(_, index):
+    # noinspection PyMethodMayBeStatic
+    def is_sos(self, index: Index):
         return index[1] < 0
 
     def get_tags(self):
@@ -109,7 +120,7 @@ class TagsAssignment(TaggedSents):
     def get_sents(self):
         return self.external_sents
 
-    def update(self, index, tag):
+    def update(self, index: Index, tag):
         self.tags[index[0]][index[1]] = tag
 
     def __str__(self):
@@ -122,34 +133,247 @@ class TagsAssignment(TaggedSents):
     def __repr__(self):
         return str(self)
 
+    def get(self) -> 'TagAssignment':
+        return self
 
+
+# TODO: move this where it belongs
+class Event:
+
+    def set_value(self, v):
+        pass
+
+
+E = TypeVar('E', bound=Event)
+
+
+class Events(Generic[E], Event):
+
+    def __init__(self, *events: E):
+        self.events : List[E] = []
+        for e in events:
+            self.add(e)
+
+    def set_value(self, v):
+        for e in self.events:
+            e.set_value(v)
+
+    def add(self, e: E):
+        self.events.append(e)
+
+    def __getitem__(self, item) -> E:
+        return self.events[item]
+
+    def __str__(self):
+        return str([str(e) for e in self.events])
+
+
+# TODO: potentially different types stored in single array is ugly
+class VariableNgram(Event):
+
+    def __init__(self, i, ngram, variable=True):
+        self._variable_index = i
+        self.ngram = list(ngram)
+        self._variable = variable
+
+    def __getitem__(self, index):
+        if index == 0:
+            return tuple(self.ngram[:-1])
+        if index == 1:
+            return self.ngram[-1]
+        else:
+            raise IndexError()
+
+    def set_value(self, v):
+        if self._variable:
+            # print('making the change:' + str(v))
+            self.ngram[self._variable_index] = v
+
+    def __str__(self):
+        return str((self.ngram[:-1], self.ngram[-1]))
+
+    def __repr__(self):
+        return repr((self.ngram[:-1], self.ngram[-1]))
+
+
+def transition_to(assignment: TagAssignment, index: Index, variable_index: Index, n: int, variable=True) \
+        -> VariableNgram:
+    (i, j) = index
+    relative_v_index = None
+    if variable:
+        (vi, vj) = variable_index
+        relative_v_index = n - 1 - (j - vj)
+    ngram = [assignment.get_tag((i, j - n + k + 1)) for k in range(n - 1)]
+    ngram.append(assignment.get_tag(index))
+    return VariableNgram(relative_v_index, ngram, variable=variable)
+
+
+def emission_at(assignment: TagAssignment, index: Index, variable_index: Index, n: int, variable=True) -> VariableNgram:
+    (i, j) = index
+    relative_v_index = None
+    if variable:
+        (vi, vj) = variable_index
+        relative_v_index = n - 2 - (j - vj)
+    ngram = [assignment.get_tag((i, j - n + 2 + k)) for k in range(n - 1)]
+    ngram.append(assignment.get_word((i, j)))
+    return VariableNgram(relative_v_index, ngram, variable=variable)
+
+
+def sent_transitions(assignment: TagAssignment, i: int, n: int):
+    return [
+        transition_to(assignment, (i, j), None, n, variable=False)
+        for j in range(assignment.s_lengths[i] + n - 1)
+    ]
+
+
+def sent_emissions(assignment: TagAssignment, i: int, n: int):
+    return [emission_at(assignment, (i, j), None, n, variable=False) for j in range(assignment.s_lengths[i])]
+
+
+D = TypeVar('D', bound=DecoratedAssignment)
+
+
+class HmmTransitionClip(Generic[D], Paperclip[D, Index, Events[VariableNgram]]):
+
+    def __init__(self, n=2):
+        super(HmmTransitionClip, self).__init__()
+        self.n = n
+
+    def extract_event(self, decorated: D, index: Index) -> Events[VariableNgram]:
+        assignment = decorated.get()
+        (i, j) = index
+        return Events[VariableNgram](
+            *[transition_to(assignment, (i, k), index, self.n, variable=True) for k in range(j, j + self.n)]
+        )
+
+
+class HmmEmissionClip(Generic[D], Paperclip[D, Index, Events[VariableNgram]]):
+
+    def __init__(self, n=2):
+        super(HmmEmissionClip, self).__init__()
+        self.n = n
+
+    def extract_event(self, decorated: D, index: Index) -> Events[VariableNgram]:
+        assignment = decorated.get()
+        (i, j) = index
+        return Events[VariableNgram](
+            *[
+                emission_at(assignment, (i, k), index, self.n, variable=True)
+                for k in range(j, min(j + self.n - 1, assignment.s_lengths[i]))
+            ]
+        )
+
+
+# TODO:
+class NgramCount(Statistic[Iterable]):
+    class Direction(IntEnum):
+        INCREMENT = 1
+        DECREMENT = -1
+
+    def __init__(self):
+        # FIXME: always default to 1 is weird, parametrize this at least
+        self._count = defaultdict(lambda: defaultdict(lambda: 1))
+        self._total = defaultdict(lambda: 1)
+
+    def clear(self):
+        self._count.clear()
+        self._total.clear()
+
+    def _update_one(self, g, direction: Direction = Direction.INCREMENT):
+        (c, t) = g
+        self._count[c] += direction
+        self._total[c] += direction
+
+    def _update(self, events: Iterable, direction: Direction = Direction.INCREMENT):
+        for g in events:
+            self._update_one(g, direction)
+
+    def forget(self, events: Iterable):
+        self._update(events, NgramCount.Direction.DECREMENT)
+
+    def collect(self, events: Iterable):
+        self._update(events, NgramCount.Direction.INCREMENT)
+
+"""
+class TruncatedNgram:
+
+    def __init__(self, offset, ngram):
+        self.full = ngram
+        self.offset = offset
+
+    def __getitem__(self, item):
+        if item == 0:
+            return tuple(self.full[0][self.offset:])
+        else:
+            return self.full[item]
+
+    def __str__(self):
+        return str(self.full)
+"""
+
+
+class TransitionCountSetter(StatisticSetter[TagAssignment, Iterable]):
+
+    def __init__(self, n : int):
+        self.n : int = n
+
+    def shape_input(self, assignment: TagAssignment) -> Iterable:
+        transitions = []
+        for i in range(assignment.n_sents):
+            transitions.extend(sent_transitions(assignment, i, self.n))
+
+        return transitions
+
+
+class EmissionCountSetter(StatisticSetter[TagAssignment, Iterable]):
+    def __init__(self, n: int):
+        self.n: int = n
+
+    def shape_input(self, assignment: TagAssignment) -> Iterable:
+        emissions = []
+        for i in range(assignment.n_sents):
+            emissions.extend(sent_emissions(assignment, i, self.n))
+
+        return emissions
+
+
+class Truncation(Transform[Events[VariableNgram, Iterable]]):
+
+    def __init__(self, offset):
+        self.offset = offset
+
+    def apply(self, events: Events[VariableNgram]) -> Iterable:
+        return ((e[0][self.offset:], e[1]) for e in events)
+
+
+def make_fallback_state(n_t: int, n_e: int, assignment: TagAssignment) -> GibbsState[Index]:
+    t_clip = HmmTransitionClip[TagAssignment](n_t)
+    clipped_t: DecoratedAssignment = t_clip.clip(assignment)
+    t_stats = [NgramCount() for _ in range(n_t)]
+    t_transforms = [Truncation(k) for k in range(n_t)]
+    t_setters = [TransitionCountSetter(k) for k in range(n_t)]
+    for k in range(n_t):
+        t_setters[k].set(t_stats[k])
+    t_clip.add_stat(t_stats[k], t_transforms[k])
+
+    e_clip = HmmEmissionClip(n_e)
+    clipped_e: GibbsState[Index] = e_clip.clip(t_clip)
+    e_stats = [NgramCount() for _ in range(n_e)]
+    e_transforms = [Truncation(k) for k in range(n_e)]
+    e_setters = [EmissionCountSetter(k) for k in range(n_e)]
+    for k in range(n_e):
+        e_setters[k].set(e_stats[k])
+    e_clip.add_stat(e_stats[k], e_transforms[k])
+
+    return clipped_e, t_stats, e_stats
+
+
+
+
+
+"""
 # TODO: Harmonize use of indices and various access functions
-class HMMCounts:
-
-    class Event:
-
-        def set_value(self, v):
-            pass
-
-    class Events(Event):
-
-        def __init__(self, *events):
-            self.events = []
-            for e in events:
-                self.add(e)
-
-        def set_value(self, v):
-            for e in self.events:
-                e.set_value(v)
-
-        def add(self, e):
-            self.events.append(e)
-
-        def __getitem__(self, item):
-            return self.events[item]
-
-        def __str__(self):
-            return str([str(e) for e in self.events])
+class NgramCount(Statistic):
 
     def __init__(self):
         self._t_count = defaultdict(lambda: defaultdict(lambda: 1))
@@ -157,11 +381,13 @@ class HMMCounts:
         self._e_count = defaultdict(lambda: defaultdict(lambda: 1))
         self._e_total = defaultdict(lambda: 1)
 
-    def refresh(self, assignment: TagsAssignment):
+    def clear(self):
         self._t_count.clear()
         self._e_count.clear()
         self._t_total.clear()
         self._e_total.clear()
+
+    def get_full_event(self, assignment : TagAssignment):
 
         for i in range(assignment.n_sents):
             for (src_tags, dest_tags) in self.sent_transitions(assignment, i):
@@ -193,8 +419,8 @@ class HMMCounts:
             self._e_count[src_tags][word] += 1
             self._e_total[src_tags] += 1
 
-    def get_event(self, assignment: TagsAssignment, index) -> Event:
-        return HMMCounts.Events(self.t_event(assignment, index), self.e_event(assignment, index))
+    def get_event(self, assignment: TagAssignment, index) -> Event:
+        return NgramCount.Events(self.t_event(assignment, index), self.e_event(assignment, index))
 
     def t_event(self, assignment, index):
         pass
@@ -219,11 +445,11 @@ class HMMCounts:
 
     def e_total(self, tag):
         return self._e_total[tag]
+"""
 
+class FallbackNgramCounts(NgramCount):
 
-class NgramHmmCounts(HMMCounts):
-
-    class Ngram(HMMCounts.Event):
+    class Ngram(Event):
 
         def __init__(self, i, ngram, variable=True):
             self._variable_index = i
@@ -250,7 +476,7 @@ class NgramHmmCounts(HMMCounts):
             return repr((self.ngram[:-1], self.ngram[-1]))
 
     def __init__(self, n=2):
-        super(NgramHmmCounts, self).__init__()
+        super(FallbackNgramCounts, self).__init__()
         self.n = n
 
     def transition_to(self, assignment, index, variable_index, variable=True):
@@ -261,7 +487,7 @@ class NgramHmmCounts(HMMCounts):
             relative_v_index = self.n - 1 - (j - vj)
         ngram = [assignment.get_tag((i, j - self.n + k + 1)) for k in range(self.n - 1)]
         ngram.append(assignment.get_tag(index))
-        return NgramHmmCounts.Ngram(relative_v_index, ngram, variable=variable)
+        return FallbackNgramCounts.Ngram(relative_v_index, ngram, variable=variable)
 
     def emission_at(self, assignment, index, variable_index, variable=True):
         (i, j) = index
@@ -271,18 +497,18 @@ class NgramHmmCounts(HMMCounts):
             relative_v_index = self.n - 2 - (j - vj)
         ngram = [assignment.get_tag((i, j - self.n + 2 + k)) for k in range(self.n - 1)]
         ngram.append(assignment.get_word((i, j)))
-        return NgramHmmCounts.Ngram(relative_v_index, ngram, variable=variable)
+        return FallbackNgramCounts.Ngram(relative_v_index, ngram, variable=variable)
 
     def t_event(self, assignment, index):
         #print('getting transition for n=% d' % self.n)
         (i, j) = index
-        return HMMCounts.Events(
+        return NgramCount.Events(
                 *[self.transition_to(assignment, (i, k), index, variable=True) for k in range(j, j + self.n)]
         )
 
     def e_event(self, assignment, index):
         (i, j) = index
-        return HMMCounts.Events(
+        return NgramCount.Events(
             *[
                 self.emission_at(assignment, (i, k), index, variable=True)
                 for k in range(j, min(j + self.n - 1, assignment.s_lengths[i]))
@@ -299,9 +525,9 @@ class NgramHmmCounts(HMMCounts):
         return [self.emission_at(assignment, (i, j), None, variable=False) for j in range(assignment.s_lengths[i])]
 
 
-class AssignmentWithStorage(GibbsState[tuple], TaggedSents):
+class AssignmentWithStorage(GibbsState[tuple[int]], TaggedSents):
 
-    def __init__(self, decorated: TagsAssignment, storage: HMMCounts):
+    def __init__(self, decorated: TagAssignment, storage: NgramCount):
         self.base = decorated
         self.storage = storage
         self.una = self.base.una
@@ -337,7 +563,7 @@ class AssignmentWithStorage(GibbsState[tuple], TaggedSents):
 
 class NgramCountWithFallBack:
 
-    class NgramWithFallBack(HMMCounts.Event):
+    class NgramWithFallBack(NgramCount.Event):
 
         class TruncatedNgram:
 
@@ -355,7 +581,7 @@ class NgramCountWithFallBack:
             def __str__(self):
                 return str(self.full_event)
 
-        def __init__(self, ngram_event: NgramHmmCounts.Ngram, n):
+        def __init__(self, ngram_event: FallbackNgramCounts.Ngram, n):
             self.full_event = ngram_event
             self.fallback_events = [
                 NgramCountWithFallBack.NgramWithFallBack.TruncatedNgram(n, offset, self.full_event)
@@ -371,7 +597,7 @@ class NgramCountWithFallBack:
         def __getitem__(self, item):
             return self.fallback_events[item]
 
-    class EventsWithFallBack(HMMCounts.Events):
+    class EventsWithFallBack(NgramCount.Events):
 
         def __init__(self, n, *events):
             super(NgramCountWithFallBack.EventsWithFallBack, self).__init__(
@@ -384,26 +610,26 @@ class NgramCountWithFallBack:
 
     def forget(self, event):
         for (i, storage) in enumerate(self.storages):
-            to_forget = HMMCounts.Events(HMMCounts.Events(*[e[i] for e in event[0]]),
-                                         HMMCounts.Events(*[e[i] for e in event[1]])
-                                         )
+            to_forget = NgramCount.Events(NgramCount.Events(*[e[i] for e in event[0]]),
+                                          NgramCount.Events(*[e[i] for e in event[1]])
+                                          )
             storage.forget(to_forget)
 
     def store(self, event):
         for (i, storage) in enumerate(self.storages):
-            to_store = HMMCounts.Events(HMMCounts.Events(*[e[i] for e in event[0]]),
-                                        HMMCounts.Events(*[e[i] for e in event[1]])
-                                        )
+            to_store = NgramCount.Events(NgramCount.Events(*[e[i] for e in event[0]]),
+                                         NgramCount.Events(*[e[i] for e in event[1]])
+                                         )
             storage.store(to_store)
 
-    def refresh(self, assignment: TagsAssignment):
+    def refresh(self, assignment: TagAssignment):
         for (i, storage) in enumerate(self.storages):
             storage.refresh(assignment)
 
-    def get_event(self, assignment: TagsAssignment, index):
+    def get_event(self, assignment: TagAssignment, index):
         original_event = self.storages[0].get_event(assignment, index)
         #print("original event: %s" % str(original_event))
-        res = HMMCounts.Events(
+        res = NgramCount.Events(
             NgramCountWithFallBack.EventsWithFallBack(self.n, *original_event[0]),
             NgramCountWithFallBack.EventsWithFallBack(self.n, *original_event[1])
             )
@@ -457,7 +683,7 @@ class DirichletP:
         return log_add(log(self.alpha) + self.base_p.logp(event), log(o)) - log(self.alpha + t)
 
 
-class RecursingP:
+class RecursiveP:
 
     def __init__(self, offset, actual_p):
         self.offset = offset
@@ -480,7 +706,7 @@ def make_backoff_dirichlet(k, alphas, n, offset=0):
     if offset == n-1:
         return UniformP(k)
     else:
-        base_p = RecursingP(offset+1, make_backoff_dirichlet(k, alphas, n, offset=offset+1))
+        base_p = RecursiveP(offset + 1, make_backoff_dirichlet(k, alphas, n, offset=offset + 1))
         return DirichletP(base_p, alphas[offset])
 
 
@@ -582,22 +808,22 @@ def uniform_index(assignment, rng):
 
 
 def naive_sampler(sents, tagset, *args, initial_tags=None, rng=default_rng, n=2, **kwargs):
-    assignment = TagsAssignment(sents, tagset, initial_tags=initial_tags)
+    assignment = TagAssignment(sents, tagset, initial_tags=initial_tags)
     index_sampler = uniform_index(assignment, rng)
     conditional_family = HMMConditional()
-    storage = NgramHmmCounts(n=n)
+    storage = FallbackNgramCounts(n=n)
     state = AssignmentWithStorage(assignment, storage)
     return gibbs_sampler(state, index_sampler, conditional_family, *args, rng, **kwargs), state
 
 
 def hierarchical_sampler(sents, tagset, *args, initial_tags=None, rng=default_rng, n=2, alphas=None, **kwargs):
-    assignment = TagsAssignment(sents, tagset, initial_tags=initial_tags)
+    assignment = TagAssignment(sents, tagset, initial_tags=initial_tags)
     index_sampler = uniform_index(assignment, rng)
     if not alphas:
         alphas = [1.0 for _ in range(n-1)]
 
     conditional_family = NgramFallBackConditional(alphas, len(tagset), n)
-    storage = NgramCountWithFallBack(NgramHmmCounts(n-i) for i in range(n-1))
+    storage = NgramCountWithFallBack(FallbackNgramCounts(n - i) for i in range(n - 1))
     state = AssignmentWithStorage(assignment, storage)
     return gibbs_sampler(state, index_sampler, conditional_family, *args, rng, **kwargs), state
 
@@ -620,7 +846,7 @@ def build_prepare_fn(sents, s_lengths):
             for i in s:
                 tags[i[0]][i[1]] = str(k)
 
-        return TagsAssignment(sents, ['%d' % i for i in range(l)], initial_tags=tags)
+        return TagAssignment(sents, ['%d' % i for i in range(l)], initial_tags=tags)
     return prepare
 
 
@@ -633,7 +859,7 @@ class HMMMAP:
         self._argmax = None
         self.counter = defaultdict(int)
 
-    def collect(self, state: HMMCounts):
+    def collect(self, state: NgramCount):
         collapsed = self.collapse(state)
         count = self.counter[collapsed] + 1
         self.counter[collapsed] = count
@@ -662,7 +888,7 @@ class HMMAverage:
         self._sample_delta = np.zeros(shape=(self.l, self.l))
         self._sample_e = np.zeros(shape=(self.v, self.l))
 
-    def collect(self, state: HMMCounts):
+    def collect(self, state: NgramCount):
         self._sample_delta.fill(0)
         self._sample_e.fill(0)
         self._norm.fill(0)
